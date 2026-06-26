@@ -1,0 +1,32 @@
+# 图像数据
+*.tif
+*.tiff
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# 模型权重
+*.pt
+*.pth
+*.ckpt
+
+# 训练输出
+*output*
+
+logs/
+runs/
+
+# 编译与缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# NPU / 内核临时文件
+kernel_meta/
+
+# agent
+.claude
+.codex
+.agents
