@@ -28,6 +28,7 @@ COMMON_DEFAULTS = {
     "small_image_threshold": 12000,
     "prefer_single_process_for_small": True,
     "save_json": True,
+    "stream_json": False,
     "save_bbox_shp": True,
     "save_mask_shp": True,
     "global_nms": False,
@@ -36,6 +37,20 @@ COMMON_DEFAULTS = {
     "supported_suffixes": {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"},
     "skip_if_output_exists": False,
     "input_color": "rgb",
+    # If the longest side of an input image exceeds this many pixels, the
+    # image is pre-split into <=N px tiles on disk before inference so the
+    # Pillow fallback reader never has to materialise the full frame. The
+    # backends already stream tiles via rasterio / GDAL, so this is only
+    # needed for PIL-only environments that hit Pillow's decompression
+    # bomb check. Default 0 (disabled) — set to e.g. 2000 to opt in.
+    "auto_split_threshold": 0,
+    "auto_split_workers": 1,
+    # Where auto-split tiles are cached. ``None`` keeps them next to the
+    # source image; the output directory is never written to by auto-split.
+    "auto_split_cache_dir": None,
+    # 建筑物轮廓正则化配置 (dict)。None/空 = 不启用。
+    # 示例: {"dp_tolerance": 0.5, "angle_threshold": 10.0, "min_area": 20.0}
+    "regularize": None,
 }
 
 YOLO_DEFAULTS = {

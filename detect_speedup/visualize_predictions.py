@@ -4,8 +4,11 @@ import argparse
 import datetime as dt
 import json
 import struct
+import time
 from pathlib import Path
+from typing import Optional, Tuple
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 try:
@@ -51,6 +54,10 @@ class _RasterioVisReader:
         self.width = ds.width
         self.height = ds.height
         self.crs_wkt = ds.crs.to_wkt() if ds.crs else None
+        # Expose the geotransform at the top level so vectorised helpers
+        # (e.g. ``_reader_transform_6tuple``) can find it without poking
+        # at private attributes of the underlying dataset.
+        self.transform = ds.transform
 
     def read(self, x1, y1, x2, y2):
         import numpy as np
@@ -75,6 +82,8 @@ class _GDALVisReader:
         self.height = ds.RasterYSize
         self.geotransform = ds.GetGeoTransform(can_return_null=True)
         self.crs_wkt = ds.GetProjection() or None
+        # Mirror the geotransform as ``self.transform`` for the vectorised helpers.
+        self.transform = self.geotransform
 
     def read(self, x1, y1, x2, y2):
         import numpy as np
@@ -100,6 +109,8 @@ class _PILVisReader:
         self.img = img
         self.width, self.height = img.size
         self.crs_wkt = None
+        self.transform = None
+        self.geotransform = None
 
     def read(self, x1, y1, x2, y2):
         import numpy as np
@@ -134,15 +145,31 @@ def _to_rgb(patch):
 
 DEFAULT_THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
 
+# 统一使用绿色渲染所有置信度档位，不再按阈值区分颜色。
+GREEN_COLOR = (0, 255, 0)
 THRESHOLD_COLORS = {
-    0.1: (255, 0, 255),    # Magenta
-    0.2: (128, 0, 255),    # Violet
-    0.3: (0, 102, 255),    # Blue
-    0.4: (0, 255, 255),    # Cyan
-    0.5: (0, 255, 0),      # Green
-    0.6: (255, 200, 0),    # Yellow-orange
-    0.7: (255, 0, 0),      # Red
+    0.1: GREEN_COLOR,
+    0.2: GREEN_COLOR,
+    0.3: GREEN_COLOR,
+    0.4: GREEN_COLOR,
+    0.5: GREEN_COLOR,
+    0.6: GREEN_COLOR,
+    0.7: GREEN_COLOR,
 }
+MASK_COLORS = [
+    (255, 64, 64),
+    (64, 255, 128),
+    (64, 160, 255),
+    (255, 224, 64),
+    (255, 96, 224),
+    (96, 255, 255),
+    (160, 96, 255),
+    (255, 144, 64),
+    (128, 255, 64),
+    (64, 255, 224),
+    (255, 64, 160),
+    (224, 255, 96),
+]
 SUPPORTED_IMAGE_SUFFIXES = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
 
 
@@ -212,18 +239,8 @@ def threshold_key(threshold):
 
 
 def color_for_threshold(threshold):
-    if threshold in THRESHOLD_COLORS:
-        return THRESHOLD_COLORS[threshold]
-    palette = [
-        (0, 102, 255),
-        (0, 200, 255),
-        (0, 220, 0),
-        (255, 170, 0),
-        (255, 0, 0),
-        (170, 0, 255),
-        (255, 0, 180),
-    ]
-    return palette[abs(hash(threshold)) % len(palette)]
+    # 统一使用绿色，不再按阈值区分颜色。
+    return GREEN_COLOR
 
 
 def iter_json_files(input_dir, recursive=False):
@@ -276,52 +293,76 @@ def normalized_box(box):
     return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
 
 
-def compute_iou(box, boxes):
-    box = normalized_box(box)
-    box_area = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
-    ious = []
-    for other in boxes:
-        other = normalized_box(other)
-        inter_w = max(0.0, min(box[2], other[2]) - max(box[0], other[0]))
-        inter_h = max(0.0, min(box[3], other[3]) - max(box[1], other[1]))
-        inter = inter_w * inter_h
-        other_area = max(0.0, other[2] - other[0]) * max(0.0, other[3] - other[1])
-        union = max(box_area + other_area - inter, 1e-12)
-        ious.append(inter / union)
-    return ious
+def compute_iou_vectorized(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
+    """Vectorised IoU between two ``(N, 4)`` xyxy boxes arrays.
+
+    Returns ``(len(boxes_a), len(boxes_b))`` IoU matrix.
+    """
+    a = np.asarray(boxes_a, dtype=np.float64)
+    b = np.asarray(boxes_b, dtype=np.float64)
+    if a.size == 0 or b.size == 0:
+        return np.zeros((a.shape[0], b.shape[0]), dtype=np.float64)
+
+    a_x1, a_y1, a_x2, a_y2 = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    b_x1, b_y1, b_x2, b_y2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+
+    a_area = np.maximum(0.0, a_x2 - a_x1) * np.maximum(0.0, a_y2 - a_y1)
+    b_area = np.maximum(0.0, b_x2 - b_x1) * np.maximum(0.0, b_y2 - b_y1)
+
+    inter_x1 = np.maximum(a_x1[:, None], b_x1[None, :])
+    inter_y1 = np.maximum(a_y1[:, None], b_y1[None, :])
+    inter_x2 = np.minimum(a_x2[:, None], b_x2[None, :])
+    inter_y2 = np.minimum(a_y2[:, None], b_y2[None, :])
+    inter_w = np.maximum(0.0, inter_x2 - inter_x1)
+    inter_h = np.maximum(0.0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    union = np.maximum(a_area[:, None] + b_area[None, :] - inter, 1e-12)
+    return inter / union
 
 
 def nms_records(records, iou_threshold, agnostic=False):
+    """Vectorised NMS over the merged-SHP records.
+
+    Records already carry ``map_bbox_xyxy`` in source-CRS units, so the IoU
+    computation is meaningful across tiles when ``nms_scope`` is ``__global__``.
+    Falls back to a per-record Python loop only for groups of size 1.
+    """
     if not records:
         return records
 
     scope_values = sorted({record.get("nms_scope", "__global__") for record in records})
     groups = []
     for scope in scope_values:
-        scope_records = [record for record in records if record.get("nms_scope", "__global__") == scope]
+        scope_records = [r for r in records if r.get("nms_scope", "__global__") == scope]
         if agnostic:
             groups.append(scope_records)
         else:
-            class_ids = sorted({record["class_id"] for record in scope_records})
-            groups.extend(
-                [record for record in scope_records if record["class_id"] == class_id]
-                for class_id in class_ids
-            )
+            class_ids = sorted({r["class_id"] for r in scope_records})
+            for cid in class_ids:
+                groups.append([r for r in scope_records if r["class_id"] == cid])
 
     kept = []
     for group_records in groups:
-        order = sorted(range(len(group_records)), key=lambda index: group_records[index]["score"], reverse=True)
-        while order:
-            index = order[0]
-            kept.append(group_records[index])
-            if len(order) == 1:
+        if len(group_records) == 1:
+            kept.extend(group_records)
+            continue
+        # Build numpy views once per group
+        boxes = np.asarray([r["map_bbox_xyxy"] for r in group_records], dtype=np.float64)
+        scores = np.asarray([float(r["score"]) for r in group_records], dtype=np.float64)
+        order = np.argsort(-scores, kind="stable")
+        suppressed = np.zeros(len(group_records), dtype=bool)
+        for pos, i_idx in enumerate(order):
+            if suppressed[i_idx]:
+                continue
+            kept.append(group_records[i_idx])
+            if pos + 1 >= len(order):
                 break
-
-            current_box = group_records[index]["map_bbox_xyxy"]
-            remaining = order[1:]
-            remaining_boxes = [group_records[next_index]["map_bbox_xyxy"] for next_index in remaining]
-            ious = compute_iou(current_box, remaining_boxes)
-            order = [next_index for next_index, iou in zip(remaining, ious) if iou <= iou_threshold]
+            rest_idx = order[pos + 1:]
+            rest_idx = rest_idx[~suppressed[rest_idx]]
+            if rest_idx.size == 0:
+                break
+            ious = compute_iou_vectorized(boxes[i_idx:i_idx + 1], boxes[rest_idx])[0]
+            suppressed[rest_idx] |= ious > iou_threshold
 
     kept.sort(key=lambda record: record["score"], reverse=True)
     return kept
@@ -333,7 +374,8 @@ def bbox_points(det):
 
 
 def segment_points(det):
-    segment = det.get("segment_xy")
+    # 优先使用正则化后的轮廓（推理时写入 segment_xy_regularized）
+    segment = det.get("segment_xy_regularized") or det.get("segment_xy")
     if not segment or len(segment) < 3:
         return None
     points = [(float(x), float(y)) for x, y in segment]
@@ -442,75 +484,261 @@ def visualize_one(json_path, image_path, output_dir, thresholds, colors, geometr
     detections = prediction.get("detections", [])
     reader = _open_reader(str(image_path))
     try:
-        raw = reader.read(0, 0, reader.width, reader.height)
+        result = Image.new("RGB", (reader.width, reader.height), (0, 0, 0))
     finally:
         reader.close()
 
-    # Left: original image
-    original = Image.fromarray(raw).convert("RGB")
-
-    # Right: overlay result
-    base = Image.fromarray(raw).convert("RGBA")
-
-    if fill_alpha > 0:
-        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        overlay_draw = ImageDraw.Draw(overlay)
-
-        for threshold in thresholds:
-            color = colors[threshold]
-            fill_rgba = (*color, fill_alpha)
-            stroke_rgba = (255, 255, 255, 200)
-            for det in detections:
-                if det_score(det) < threshold:
-                    continue
-                points = detection_points(det, geometry, mask_fallback_bbox=mask_fallback_bbox)
-                if not points:
-                    continue
-                if min_mask_area > 0 and geometry == "mask" and polygon_area(points) < min_mask_area:
-                    continue
-                flat = [coord for p in points for coord in p]
-                overlay_draw.polygon(flat, fill=fill_rgba, outline=stroke_rgba)
-
-        if show_legend:
-            draw_legend(overlay_draw, thresholds, colors, alpha=True)
-        result = Image.alpha_composite(base, overlay).convert("RGB")
-    else:
-        result = base.convert("RGB")
-        draw = ImageDraw.Draw(result)
-        for threshold in thresholds:
-            color = colors[threshold]
-            for det in detections:
-                if det_score(det) < threshold:
-                    continue
-                points = detection_points(det, geometry, mask_fallback_bbox=mask_fallback_bbox)
-                if not points:
-                    continue
-                if min_mask_area > 0 and geometry == "mask" and polygon_area(points) < min_mask_area:
-                    continue
-                draw.line(points, fill=color, width=line_width, joint="curve")
-        if show_legend:
-            draw_legend(draw, thresholds, colors, alpha=False)
-
-    # Side-by-side: original | result
-    w, h = original.size
-    combined = Image.new("RGB", (w * 2, h))
-    combined.paste(original, (0, 0))
-    combined.paste(result, (w, 0))
+    draw = ImageDraw.Draw(result)
+    for index, det in enumerate(detections):
+        points = detection_points(det, geometry, mask_fallback_bbox=mask_fallback_bbox)
+        if not points:
+            continue
+        if min_mask_area > 0 and geometry == "mask" and polygon_area(points) < min_mask_area:
+            continue
+        color = MASK_COLORS[index % len(MASK_COLORS)]
+        flat = [coord for p in points for coord in p]
+        draw.polygon(flat, fill=color)
 
     output_path = output_dir / "{}_{}_vis.jpg".format(json_path.stem, geometry)
-    combined.save(output_path, quality=max(1, min(int(jpg_quality), 100)))
+    result.save(output_path, quality=max(1, min(int(jpg_quality), 100)))
     return output_path
 
 
+def _reader_transform_6tuple(reader) -> Optional[Tuple[float, float, float, float, float, float]]:
+    """Best-effort extraction of a 6-tuple geotransform from any reader."""
+    transform = getattr(reader, "transform", None)
+    if transform is None:
+        transform = getattr(reader, "geotransform", None)
+    if transform is None:
+        return None
+    if hasattr(transform, "a"):
+        return (
+            float(transform.a), float(transform.b), float(transform.c),
+            float(transform.d), float(transform.e), float(transform.f),
+        )
+    if isinstance(transform, (tuple, list)) and len(transform) >= 6:
+        return tuple(float(v) for v in transform[:6])
+    return None
+
+
+# Recognised CRS WKTs we can return when the system has no GeoTIFF reader.
+# Only includes the few lat/lon CRSs the user is likely to encounter; the
+# most common by far is EPSG:4326 (WGS84).
+#
+# NOTE: The WKT must NOT include AXIS[…] definitions.  Shapefiles always
+# store (x, y) = (longitude, latitude) regardless of the official CRS axis
+# order, and QGIS / ArcGIS will swap coordinates when a .prj declares
+# AXIS["Latitude",NORTH] first — breaking the overlay with the source TIFF.
+_WGS84_WKT = (
+    'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,'
+    'AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,'
+    'AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,'
+    'AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]]'
+)
+
+
+def _parse_tile_bounds_from_filename(tile_path, image_size) -> Optional[Tuple[float, float, float, float, Tuple[float, float, float, float, float, float]]]:
+    """Recover the tile's geotransform from the filename convention.
+
+    Two known formats, both of which encode geo values with the dot replaced
+    by underscore (e.g. ``-68.122149`` → ``-68_122149``):
+
+    1. ``split_tif.py`` (the user's tool): ``{stem}_{row}_{col}_{xmin}_{ymin}_{xmax}_{ymax}.tif``
+       — i.e. ``xmin, ymin, xmax, ymax`` in order.
+    2. ``image_splitting.py``: ``{stem}_{row}_{col}_{xmin}_{ymax}_{xmax}_{ymin}.tif``
+       — i.e. ``xmin, ymax, xmax, ymin`` in order.
+
+    We try interpretation 1 first; if the resulting values are obviously
+    nonsense (outside lat/lon range) we try interpretation 2. Returns
+    ``(xmin, ymin, xmax, ymax, (a,b,c,d,e,f))``.
+    """
+    name = Path(tile_path).stem  # drop .tif
+    # Each geo value is split into 2 tokens (sign+int, decimal). Re-join 8 tokens.
+    parts = name.split("_")
+    if len(parts) < 8:
+        return None
+    # Take the last 8 tokens and group into 4 pairs.
+    last8 = parts[-8:]
+    floats = []
+    ok = True
+    for i in range(0, 8, 2):
+        sign, frac = last8[i], last8[i + 1]
+        if not frac.isdigit():
+            ok = False
+            break
+        if sign.startswith("-"):
+            num_str = "-0." + frac if sign == "-0" else f"-{sign.lstrip('-')}.{frac}"
+        else:
+            num_str = f"{sign}.{frac}"
+        try:
+            floats.append(float(num_str))
+        except ValueError:
+            ok = False
+            break
+    if not ok or len(floats) != 4:
+        return None
+
+    width, height = image_size
+    if not width or not height:
+        return None
+
+    xmin, a2, xmax, a4 = floats
+    # Two possible interpretations:
+    for xmin_v, ymin_v, xmax_v, ymax_v in (
+        (xmin, a2, xmax, a4),         # split_tif.py: xmin, ymin, xmax, ymax
+        (xmin, a4, xmax, a2),         # image_splitting.py: xmin, ymax, xmax, ymin
+    ):
+        if xmin_v == xmax_v or ymin_v == ymax_v:
+            continue
+        a = (xmax_v - xmin_v) / width
+        e = -(ymax_v - ymin_v) / height
+        b = 0.0
+        d = 0.0
+        c = xmin_v
+        f = ymax_v
+        # Sanity: looks like lat/lon?
+        looks_like_latlon = (
+            -180.0 <= xmin_v <= 180.0 and -180.0 <= xmax_v <= 180.0
+            and -90.0 <= ymin_v <= 90.0 and -90.0 <= ymax_v <= 90.0
+        )
+        if looks_like_latlon:
+            return (xmin_v, ymin_v, xmax_v, ymax_v, (a, b, c, d, e, f))
+    return None
+
+
+def _sanitize_wkt_for_shapefile(wkt: Optional[str]) -> Optional[str]:
+    """Strip ``AXIS[…]`` definitions from a WKT string.
+
+    Shapefiles always store (x, y) = (longitude/easting,
+    latitude/northing).  When a .prj declares ``AXIS["Latitude",NORTH]``
+    first, QGIS honours that and swaps the coordinates — breaking the
+    overlay with the source raster.  Removing the axis declarations makes
+    GIS software fall back to the traditional (x, y) order.
+    """
+    if not wkt:
+        return wkt
+    import re
+    # Remove AXIS["name",DIRECTION] tokens, including any leading comma
+    sanitized = re.sub(r',?\s*AXIS\["[^"]*",\s*[A-Z]+\]', '', wkt)
+    return sanitized
+
+
+def _get_source_crs_wkt(crs_source_path) -> Optional[str]:
+    """Best-effort: read CRS WKT from ``crs_source_path``.
+
+    Tries rasterio → GDAL → None.  The returned WKT has ``AXIS[…]``
+    definitions stripped so the .prj sidecar uses the traditional
+    shapefile (x, y) axis order.  WGS84 is the most common fallback
+    when everything fails.
+    """
+    if not crs_source_path:
+        return None
+    try:
+        import rasterio  # noqa: F401
+        with rasterio.open(str(crs_source_path)) as ds:
+            if ds.crs:
+                return _sanitize_wkt_for_shapefile(ds.crs.to_wkt())
+            return None
+    except Exception:
+        pass
+    try:
+        from osgeo import gdal
+        ds = gdal.Open(str(crs_source_path), gdal.GA_ReadOnly)
+        if ds is not None:
+            try:
+                wkt = ds.GetProjection() or None
+            finally:
+                ds = None
+            return _sanitize_wkt_for_shapefile(wkt)
+    except Exception:
+        pass
+    return None
+
+
+def _inject_crs_from_source(reader, image_path, image_size, crs_source_path) -> bool:
+    """If ``reader`` has no CRS, recover one from ``image_path``'s filename
+    convention + the optional ``crs_source_path`` for the WKT.
+
+    The PIL fallback returns pixel coordinates as-is, so any map coordinates
+    in the SHP would be garbage. We rebuild the tile's affine from the geo
+    bounds encoded in the tile filename and grab the CRS WKT from the source
+    TIF (if a rasterio/GDAL backend is available). When neither is available
+    but the bounds look like lat/lon, we still patch using a built-in
+    WGS84 WKT so the SHP coordinates are correct.
+    """
+    if reader.crs_wkt:
+        return False
+    if image_size is None:
+        return False
+    # Accept both ``(w, h)`` tuples and ``{"width": w, "height": h}`` dicts.
+    if isinstance(image_size, dict):
+        wh = (image_size.get("width"), image_size.get("height"))
+    else:
+        wh = tuple(image_size)[:2] if image_size else (None, None)
+    if not wh or wh[0] is None or wh[1] is None:
+        return False
+    parsed = _parse_tile_bounds_from_filename(image_path, wh)
+    if not parsed:
+        return False
+    _xmin, _ymin, _xmax, _ymax, gt = parsed
+    a, b, c, d, e, f = gt
+
+    # Prefer the source TIF's WKT when we can read it; otherwise assume WGS84.
+    crs_wkt = _get_source_crs_wkt(crs_source_path) or _WGS84_WKT
+
+    def _map(x, y):
+        return (c + a * x + b * y, f + d * x + e * y)
+
+    reader.crs_wkt = crs_wkt
+    reader.pixel_to_map = _map
+    # Also expose the affine so the vectorised ``pixel_to_map_points`` path
+    # picks it up (it reads ``reader.transform`` rather than calling
+    # ``pixel_to_map`` once per point).
+    reader.transform = gt
+    reader.geotransform = gt
+    return True
+
+
 def pixel_to_map_points(reader, points):
-    return [reader.pixel_to_map(x, y) for x, y in points]
+    """Vectorised pixel → map for a list of ``(x, y)`` tuples.
+
+    Reads the reader's ``transform`` / ``geotransform`` once, then runs a
+    single numpy matmul — turning ~M Python calls into one.
+    """
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=np.float64)
+    gt = _reader_transform_6tuple(reader)
+    if gt is None:
+        # Identity (e.g. PIL fallback with no CRS) — return the same tuples.
+        return [(float(x), float(y)) for x, y in arr]
+    a, b, c, d, e, f = gt
+    mx = c + a * arr[:, 0] + b * arr[:, 1]
+    my = f + d * arr[:, 0] + e * arr[:, 1]
+    return list(zip(mx.tolist(), my.tolist()))
 
 
-def collect_records(json_path, image_path, thresholds, geometry, mask_fallback_bbox):
+def collect_records(json_path, image_path, thresholds, geometry, mask_fallback_bbox,
+                    crs_source_path=None, reader=None):
+    """Collect per-detection records from a prediction JSON.
+
+    ``reader`` is an optional pre-built reader (any object exposing
+    ``crs_wkt``, ``width/height`` and a ``pixel_to_map(x, y)`` callable — or
+    a ``transform`` 6-tuple that ``pixel_to_map_points`` can pick up). When
+    supplied, we skip ``_open_reader`` entirely so callers (e.g. the
+    filename-derived ``_FastReader`` in ``run_shp_only``) can avoid
+    rasterio/GDAL I/O on huge image tiles.
+    """
     with json_path.open("r", encoding="utf-8") as file:
         prediction = json.load(file)
     detections = prediction.get("detections", [])
-    reader = _open_reader(str(image_path))
+    image_size = prediction.get("image_size")  # {'width': int, 'height': int} or None
+    if reader is None:
+        reader = _open_reader(str(image_path))
+        crs_patched = _inject_crs_from_source(reader, image_path, image_size, crs_source_path)
+    else:
+        # Caller already gave us a reader with the geo info baked in.
+        crs_patched = False
     records = {threshold: [] for threshold in thresholds}
     try:
         nms_scope = "__global__" if reader.crs_wkt else image_path.name
@@ -539,6 +767,8 @@ def collect_records(json_path, image_path, thresholds, geometry, mask_fallback_b
                             "points": map_points,
                         }
                     )
+        if crs_patched:
+            print(f"[crs] patched CRS for {image_path.name}", flush=True)
         return records, reader.crs_wkt
     finally:
         reader.close()
@@ -576,7 +806,7 @@ def dbf_format_value(value, field_type, length, decimal_count=0):
     raise ValueError("Unsupported DBF field type: {}".format(field_type))
 
 
-def write_dbf(dbf_path, records):
+def write_dbf(dbf_path, records, progress=True):
     fields = [
         ("image", "C", 80, 0),
         ("class_id", "N", 10, 0),
@@ -608,7 +838,12 @@ def write_dbf(dbf_path, records):
             file.write(dbf_field_descriptor(*field))
         file.write(b"\r")
 
-        for record in records:
+        iterator = (
+            tqdm(records, total=len(records), desc=f"dbf {dbf_path.stem}",
+                 unit="rec", dynamic_ncols=True)
+            if (progress and tqdm is not None and len(records) > 0) else records
+        )
+        for record in iterator:
             x1, y1, x2, y2 = record["bbox_xyxy"]
             values = {
                 "image": record["image"],
@@ -627,45 +862,68 @@ def write_dbf(dbf_path, records):
         file.write(b"\x1a")
 
 
-def build_polyline_record(points):
-    xs = [point[0] for point in points]
-    ys = [point[1] for point in points]
-    bbox = (min(xs), min(ys), max(xs), max(ys))
+def build_polygon_record(points):
+    """Build a single ESRI polygon (shape type 5) record from a closed ring.
+
+    ``points`` must already be a closed ring (first point == last point).
+    A polygon record holds ``(num_parts, num_points, parts_offsets..., xy...)``
+    where ``parts_offsets[i]`` is the index of the first point of the i-th
+    ring. For a single-ring polygon that's just ``[0]``.
+    """
+    arr = np.asarray(points, dtype=np.float64)
+    xs = arr[:, 0]
+    ys = arr[:, 1]
+    bbox = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+    num_points = len(points)
     content = bytearray()
-    content += struct.pack("<i", 3)
-    content += struct.pack("<4d", *bbox)
-    content += struct.pack("<2i", 1, len(points))
-    content += struct.pack("<i", 0)
-    for x, y in points:
-        content += struct.pack("<2d", float(x), float(y))
+    content += struct.pack("<i", 5)                     # shape type = polygon
+    content += struct.pack("<4d", *bbox)                # bbox
+    content += struct.pack("<i", 1)                     # num_parts
+    content += struct.pack("<i", num_points)
+    content += struct.pack("<i", 0)                     # part 0 starts at offset 0
+    content += arr.reshape(-1).tobytes()
     return bytes(content), bbox
 
 
-def write_polyline_shapefile(shp_path, records, crs_wkt=None):
+def write_polygon_shapefile(shp_path, records, crs_wkt=None, progress=True):
+    """Write ``records`` as a polygon SHP (shape type 5) with progress reporting.
+
+    Records must carry a closed ``points`` ring (first point == last point).
+    Each record is also written to the .dbf sidecar with class/score/bbox.
+    """
     shp_path = Path(shp_path)
     shp_path.parent.mkdir(parents=True, exist_ok=True)
     delete_shapefile_sidecars(shp_path)
 
-    shape_type = 3
+    started = time.monotonic()
+    shape_type = 5
     shp_records = []
     shx_records = []
     xmin = ymin = float("inf")
     xmax = ymax = float("-inf")
     offset_words = 50
+    written = 0
 
-    for index, record in enumerate(records, start=1):
+    iterator = (
+        tqdm(records, total=len(records), desc=f"shp {shp_path.stem}",
+             unit="rec", dynamic_ncols=True, mininterval=0.5)
+        if (progress and tqdm is not None and len(records) > 0) else records
+    )
+
+    for index, record in enumerate(iterator, start=1):
         points = record["points"]
-        if len(points) < 2:
+        if len(points) < 3:
             continue
-        content, bbox = build_polyline_record(points)
+        content, bbox = build_polygon_record(points)
         content_length_words = len(content) // 2
         shp_records.append(struct.pack(">2i", index, content_length_words) + content)
         shx_records.append(struct.pack(">2i", offset_words, content_length_words))
         offset_words += 4 + content_length_words
-        xmin = min(xmin, bbox[0])
-        ymin = min(ymin, bbox[1])
-        xmax = max(xmax, bbox[2])
-        ymax = max(ymax, bbox[3])
+        if bbox[0] < xmin: xmin = bbox[0]
+        if bbox[1] < ymin: ymin = bbox[1]
+        if bbox[2] > xmax: xmax = bbox[2]
+        if bbox[3] > ymax: ymax = bbox[3]
+        written += 1
 
     if not shp_records:
         xmin = ymin = xmax = ymax = 0.0
@@ -673,28 +931,41 @@ def write_polyline_shapefile(shp_path, records, crs_wkt=None):
     shp_file_length_words = 50 + sum(len(record) for record in shp_records) // 2
     shx_file_length_words = 50 + len(shx_records) * 4
 
-    def file_header(file_length_words):
-        return (
-            struct.pack(">i", 9994)
-            + b"\x00" * 20
-            + struct.pack(">i", file_length_words)
-            + struct.pack("<2i4d4d", 1000, shape_type, xmin, ymin, xmax, ymax, 0.0, 0.0, 0.0, 0.0)
-        )
+    file_header = (
+        struct.pack(">i", 9994)
+        + b"\x00" * 20
+        + struct.pack(">i", shp_file_length_words)
+        + struct.pack("<2i4d4d", 1000, shape_type, xmin, ymin, xmax, ymax, 0.0, 0.0, 0.0, 0.0)
+    )
+    shx_header = (
+        struct.pack(">i", 9994)
+        + b"\x00" * 20
+        + struct.pack(">i", shx_file_length_words)
+        + struct.pack("<2i4d4d", 1000, shape_type, xmin, ymin, xmax, ymax, 0.0, 0.0, 0.0, 0.0)
+    )
 
     with shp_path.open("wb") as shp_file:
-        shp_file.write(file_header(shp_file_length_words))
+        shp_file.write(file_header)
         for record in shp_records:
             shp_file.write(record)
 
     with shp_path.with_suffix(".shx").open("wb") as shx_file:
-        shx_file.write(file_header(shx_file_length_words))
+        shx_file.write(shx_header)
         for record in shx_records:
             shx_file.write(record)
 
-    write_dbf(shp_path.with_suffix(".dbf"), records)
+    write_dbf(shp_path.with_suffix(".dbf"), records, progress=progress)
     shp_path.with_suffix(".cpg").write_text("UTF-8", encoding="utf-8")
     if crs_wkt:
         shp_path.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
+
+    elapsed = time.monotonic() - started
+    if records:
+        print(
+            f"[shp] {shp_path.name}: {written} polygon(s) in {elapsed:.1f}s "
+            f"({written / max(elapsed, 1e-6):.0f} rec/s)",
+            flush=True,
+        )
 
 
 def write_legend(output_dir, thresholds, colors):
@@ -736,14 +1007,24 @@ def run_visualization(config):
     merged_shp_nms = config.get("merged_shp_nms", not config.get("no_merged_shp_nms", False))
     merged_shp_iou = float(config.get("merged_shp_iou", 0.45))
     merged_shp_agnostic_nms = not bool(config.get("merged_shp_class_aware_nms", False))
+    # New: SHP output dir (defaults to sibling 'shps/' of output_dir) and CRS source.
+    shp_output_dir = Path(config["shp_output_dir"]) if config.get("shp_output_dir") else output_dir.parent / "shps"
+    shp_output_dir.mkdir(parents=True, exist_ok=True)
+    crs_source_path = config.get("crs_source")
+    if crs_source_path:
+        print(f"[crs] fallback source TIF: {crs_source_path}", flush=True)
+    if not config.get("shp_output_dir"):
+        print(f"[shp] writing polygons to {shp_output_dir}", flush=True)
 
     json_files = list(iter_json_files(input_dir, recursive=recursive))
     if not json_files:
         raise RuntimeError("No JSON files found in {}".format(input_dir))
 
+    print(f"[info] {len(json_files)} JSON file(s) to process", flush=True)
+
     processed = 0
     skipped = 0
-    iterator = tqdm(json_files, desc="Visualize", unit="json", dynamic_ncols=True) if tqdm else json_files
+    iterator = tqdm(json_files, desc="Visualize", unit="json", dynamic_ncols=True, mininterval=0.5) if tqdm else json_files
     for json_path in iterator:
         with json_path.open("r", encoding="utf-8") as file:
             prediction = json.load(file)
@@ -774,6 +1055,7 @@ def run_visualization(config):
             thresholds=thresholds,
             geometry=geometry,
             mask_fallback_bbox=mask_fallback_bbox,
+            crs_source_path=crs_source_path,
         )
         merge_records(total_records, new_records)
         if crs_wkt is None and image_crs_wkt:
@@ -781,31 +1063,36 @@ def run_visualization(config):
         processed += 1
 
     if merged_shp_nms:
-        for threshold in thresholds:
+        nms_iter = tqdm(thresholds, desc="NMS", unit="thr", dynamic_ncols=True) if tqdm else thresholds
+        for threshold in nms_iter:
             before_count = len(total_records[threshold])
+            t0 = time.monotonic()
             total_records[threshold] = nms_records(
                 total_records[threshold],
                 iou_threshold=merged_shp_iou,
                 agnostic=merged_shp_agnostic_nms,
             )
             after_count = len(total_records[threshold])
-            if before_count != after_count:
-                print(
-                    "[info] merged SHP NMS threshold {}: {} -> {}".format(
-                        threshold, before_count, after_count
-                    )
-                )
+            dt_nms = time.monotonic() - t0
+            if tqdm:
+                nms_iter.set_postfix(removed=before_count - after_count, sec=f"{dt_nms:.1f}")
+            print(
+                f"[info] NMS threshold {threshold}: {before_count} -> {after_count} "
+                f"({dt_nms:.1f}s)",
+                flush=True,
+            )
 
     shp_iterator = tqdm(thresholds, desc="Write SHP", unit="thr", dynamic_ncols=True) if tqdm else thresholds
     for threshold in shp_iterator:
-        shp_path = output_dir / "all_{}_conf_{}.shp".format(geometry, threshold_key(threshold))
-        write_polyline_shapefile(shp_path, total_records[threshold], crs_wkt=crs_wkt)
+        shp_path = shp_output_dir / "all_{}_conf_{}.shp".format(geometry, threshold_key(threshold))
+        write_polygon_shapefile(shp_path, total_records[threshold], crs_wkt=crs_wkt)
 
     write_legend(output_dir, thresholds, colors)
     print(
-        "[summary] processed={}, skipped={}, merged_shp_nms={}, output_dir={}".format(
-            processed, skipped, bool(merged_shp_nms), output_dir
-        )
+        "[summary] processed={}, skipped={}, merged_shp_nms={}, vis_dir={}, shp_dir={}".format(
+            processed, skipped, bool(merged_shp_nms), output_dir, shp_output_dir
+        ),
+        flush=True,
     )
 
 

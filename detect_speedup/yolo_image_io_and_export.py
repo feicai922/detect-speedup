@@ -3,6 +3,7 @@ from . import runtime_warning_filters  # noqa: F401
 import argparse
 import datetime as dt
 import json
+import os
 import struct
 import warnings
 from pathlib import Path
@@ -528,6 +529,16 @@ def ensure_device(device):
         torch.cuda.set_device(device_str)
 
 
+def bind_process_device(device):
+    device = str(device)
+    if device.startswith(("cuda:", "gpu:")):
+        index = device.split(":", 1)[1]
+        if index.isdigit():
+            os.environ["CUDA_VISIBLE_DEVICES"] = index
+            return "cuda:0"
+    return device
+
+
 def yolo_predict_device(device):
     device = str(device)
     if device.startswith("npu:"):
@@ -746,22 +757,14 @@ def _write_prj(prj_path, crs_wkt):
 
 
 def write_shapefile(shp_path, detections, reader, geometry="bbox"):
-    shp_path = Path(shp_path)
-    shp_path.parent.mkdir(parents=True, exist_ok=True)
-    _delete_shapefile_sidecars(shp_path)
+    """Thin wrapper around :func:`shapefile_export.write_shapefile`.
 
-    if geometry == "bbox":
-        geometry_builder = lambda det: bbox_to_ring_coords(reader, det["bbox_xyxy"])
-        export_detections = detections
-    elif geometry == "mask":
-        geometry_builder = lambda det: mask_to_ring_coords(reader, det.get("segment_xy"))
-        export_detections = [det for det in detections if det.get("segment_xy")]
-    else:
-        raise ValueError(f"Unsupported geometry type: {geometry}")
-
-    _write_shp_shx(shp_path, export_detections, geometry_builder)
-    _write_dbf(shp_path.with_suffix(".dbf"), export_detections)
-    _write_prj(shp_path.with_suffix(".prj"), reader.crs_wkt)
+    Kept here for backward compatibility — the actual implementation now lives
+    in :mod:`shapefile_export` and adds per-detection tqdm progress plus
+    vectorised pixel→map conversion.
+    """
+    from .shapefile_export import write_shapefile as _shared_write_shapefile
+    _shared_write_shapefile(shp_path, detections, reader, geometry=geometry)
 
 
 def main():
@@ -774,7 +777,8 @@ def main():
     if args.batch_size <= 0:
         raise ValueError("batch_size must be positive.")
 
-    ensure_device(args.device)
+    device = bind_process_device(args.device)
+    ensure_device(device)
 
     source_path = Path(args.source)
     output_path, output_bbox_shp_path, output_mask_shp_path = resolve_output_paths(
@@ -807,7 +811,7 @@ def main():
         for batch_images, batch_windows in tile_batches(reader, windows, args.batch_size):
             results = model.predict(
                 source=batch_images,
-                device=yolo_predict_device(args.device),
+                device=yolo_predict_device(device),
                 imgsz=args.imgsz,
                 conf=args.conf,
                 iou=args.iou,

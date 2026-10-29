@@ -30,9 +30,13 @@ examples:
     )
     parser.add_argument("input_dir", help="Directory containing prediction JSON files")
     parser.add_argument("--output", default=None,
-                        help="Output directory (default: <input_dir>/../vis)")
+                        help="Visualization (JPG) output directory (default: <input_dir>/../vis)")
+    parser.add_argument("--shp-output", default=None,
+                        help="Polygon SHP output directory (default: <input_dir>/../shps)")
     parser.add_argument("--image-dir", default=None,
                         help="Source image directory (default: auto-detect)")
+    parser.add_argument("--crs-source", default=None,
+                        help="Source TIF (with CRS) used to patch map coordinates when per-tile readers lack one")
     parser.add_argument("--geometry", choices=("mask", "bbox", "obb"), default="mask",
                         help="Geometry: mask (default), bbox, or obb")
     parser.add_argument("--no-fill", action="store_true",
@@ -56,6 +60,8 @@ def main():
     input_dir = os.path.abspath(args.input_dir)
     if args.output is None:
         args.output = os.path.join(os.path.dirname(input_dir.rstrip("/")), "vis")
+    if args.shp_output is None:
+        args.shp_output = os.path.join(os.path.dirname(input_dir.rstrip("/")), "shps")
 
     if args.image_dir is None:
         args.image_dir = os.path.dirname(os.path.dirname(input_dir.rstrip("/")))
@@ -63,7 +69,9 @@ def main():
     config = {
         "input_dir": input_dir,
         "output_dir": args.output,
+        "shp_output_dir": args.shp_output,
         "image_dir": args.image_dir,
+        "crs_source": args.crs_source,
         "geometry": args.geometry,
         "thresholds": args.thresholds,
         "line_width": args.line_width,

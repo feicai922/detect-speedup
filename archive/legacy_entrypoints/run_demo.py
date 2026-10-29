@@ -8,6 +8,9 @@ Examples:
     python run_demo.py --yolo --model best.pt --input /path/to/images --devices cuda:0,cuda:1
 """
 
+
+import pathlib as _pl, sys as _sys
+_sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))  # repo root
 import argparse
 import os
 import datetime as dt

@@ -40,6 +40,26 @@ class BaseInferenceAdapter:
             {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"},
         )
 
+    @property
+    def auto_split_threshold(self):
+        """Opt-in: when > 0, inputs whose longest side exceeds this value are
+        pre-split into ``<= auto_split_threshold`` tiles before inference.
+        Default 0 — the backends already stream tiles via rasterio / GDAL, so
+        this is only needed for PIL-only environments that hit the
+        decompression-bomb check."""
+        return self.config.get("auto_split_threshold", 0)
+
+    @property
+    def auto_split_workers(self):
+        return int(self.config.get("auto_split_workers", 1))
+
+    @property
+    def auto_split_cache_dir(self):
+        """Override the directory used to cache auto-split tiles. ``None``
+        (default) places the cache alongside the source image so the output
+        directory stays untouched."""
+        return self.config.get("auto_split_cache_dir")
+
     def output_paths(self, input_file, output_dir):
         return build_output_paths(
             input_path=self.config["input_path"],
@@ -72,6 +92,7 @@ class YOLOInferenceAdapter(BaseInferenceAdapter):
             output_bbox_shp=str(bbox_shp) if bbox_shp is not None else None,
             output_mask_shp=str(mask_shp) if mask_shp is not None else None,
             save_json=self.config.get("save_json", True),
+            stream_json=self.config.get("stream_json", False),
             devices=self.devices,
             worker_count=self.config.get("worker_count"),
             reader_workers=self.config.get("reader_workers", 1),
@@ -92,6 +113,7 @@ class YOLOInferenceAdapter(BaseInferenceAdapter):
             prefer_single_process_for_small=self.config.get("prefer_single_process_for_small", True),
             stretch_to_uint8=self.config.get("stretch_to_uint8", False),
             input_color=self.config.get("input_color", "rgb"),
+            regularize=self.config.get("regularize"),
         )
 
     def build_device_bound_config(self, input_file, output_dir, device):
@@ -149,6 +171,7 @@ class MMDetInferenceAdapter(BaseInferenceAdapter):
             global_iou=self.config.get("global_iou", 0.45),
             fp16=self.config.get("fp16", False),
             save_mask_overlay=self.config.get("save_mask_overlay", False),
+            regularize=self.config.get("regularize"),
         )
 
     def build_device_bound_config(self, input_file, output_dir, device):
@@ -208,6 +231,8 @@ class RFDETRInferenceAdapter(BaseInferenceAdapter):
             global_iou=self.config.get("global_iou", 0.45),
             stretch_to_uint8=self.config.get("stretch_to_uint8", False),
             input_color=self.config.get("input_color", "rgb"),
+            fp16=self.config.get('fp16', False),
+            regularize=self.config.get("regularize"),
         )
 
     def build_device_bound_config(self, input_file, output_dir, device):

@@ -31,7 +31,9 @@ def _quiet_showwarning(message, category, filename, lineno, file=None, line=None
 
 warnings._unify_original_warn = _ORIGINAL_WARN
 warnings._unify_original_showwarning = _ORIGINAL_SHOWWARNING
-warnings.warn = _quiet_warn
+# 必须保留内建 warn：PyTorch JIT 会识别它；替换成 Python 包装函数会
+# 让 RF-DETR 的脚本化损失编译到 ResourceWarning 类型并报错。
+warnings.warn = _ORIGINAL_WARN
 warnings.showwarning = _quiet_showwarning
 
 warnings.filterwarnings("ignore", category=ResourceWarning)

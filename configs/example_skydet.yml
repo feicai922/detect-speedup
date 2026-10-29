@@ -1,0 +1,13 @@
+# 示例：插件后端 skydet（通用滑窗循环）
+backend: skydet
+model: /data1/wzh26/runs/skydet_gzda_v1_640_bs8/best_stg1.pth
+backend_config: /data1/wzh26/code/SKYDET/configs/skydet/skydet_gzda_v1_640_bs8.yml
+input: /data1/wzh26/data/1023测试影像/1/pre.tif
+out: ./output/example_skydet
+tile: 640
+stride: 512
+conf: 0.3
+iou: 0.5
+batch: 4
+device: cuda:1
+# 运行前需要：PYTHONPATH=/home/wzh26/skydet_pkgs

@@ -1,0 +1,14 @@
+# 示例：原生后端 yolo（多进程多卡流水线）
+backend: yolo
+model: /data1/wzh26/code/yolo/runs/segment/gzda_building_map_0.4_0.6m-2/weights/best.pt
+input: /data1/wzh26/data/1023测试影像/1/pre.tif
+out: ./output/example_yolo
+tile: 1024
+stride: 896
+imgsz: 640
+conf: 0.3
+iou: 0.45
+batch: 4
+device: cuda:0            # 多卡写 "cuda:0,cuda:2"
+# geometry: mask          # 分割后端默认 auto → mask
+# no_vis: true            # 只出 JSON

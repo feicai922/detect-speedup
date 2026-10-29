@@ -55,19 +55,22 @@ def load_model(
     resolution: int = 640,
 ) -> Tuple[Any, List[str]]:
     """Load RF-DETR model from checkpoint and move to device."""
-    from rfdetr import RFDETRLarge
+    from rfdetr import RFDETR, RFDETRLarge
 
     device = normalize_device(device)
     is_npu = device.startswith("npu")
 
-    rfdetr = RFDETRLarge(
-        num_classes=num_classes,
-        pretrain_weights=checkpoint_path,
-        amp=False,
-        fused_optimizer=False,
-        device="cuda" if is_npu else device,
-        resolution=resolution,
-    )
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False, mmap=True)
+    is_segmentation = bool(checkpoint.get('model_config', {}).get('segmentation_head'))
+    is_segmentation = is_segmentation or str(checkpoint.get('model_name', '')).startswith('RFDETRSeg')
+    options = dict(num_classes=num_classes, amp=False, fused_optimizer=False,
+                   device='cuda' if is_npu else device, resolution=resolution)
+    if is_segmentation:
+        # 从训练元数据恢复正确的 Seg 变体、位置编码与查询数，避免误用检测 Large。
+        rfdetr = RFDETR.from_checkpoint(checkpoint_path, **options)
+        rfdetr.model.model.load_state_dict(checkpoint['model'], strict=True)
+    else:
+        rfdetr = RFDETRLarge(pretrain_weights=checkpoint_path, **options)
 
     nn_model = rfdetr.model.model
     nn_model = nn_model.to(device)
@@ -79,6 +82,11 @@ def load_model(
         if hasattr(rfdetr, "class_names")
         else [f"class_{i}" for i in range(num_classes)]
     )
+    if is_segmentation:
+        saved_args = checkpoint.get('args', {})
+        saved_names = saved_args.get('class_names') if isinstance(saved_args, dict) else getattr(saved_args, 'class_names', None)
+        if saved_names:
+            class_names = list(saved_names)
     return rfdetr, class_names
 
 

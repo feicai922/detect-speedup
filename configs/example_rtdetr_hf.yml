@@ -1,0 +1,11 @@
+# 示例：插件后端 rtdetr-hf（HuggingFace transformers）
+backend: rtdetr-hf
+model: /data1/wzh26/重研/code/runs/down-rt-detr
+input: /data1/wzh26/data/1023测试影像/1/pre.tif
+out: ./output/example_rtdetr
+tile: 640
+stride: 512
+conf: 0.3
+batch: 4
+device: cuda:1
+# 环境用 conda activate rtdetr（transformers 4.44）

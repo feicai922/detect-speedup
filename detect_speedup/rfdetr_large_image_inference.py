@@ -60,6 +60,9 @@ class MultiprocessRFDETRInferConfig:
     prefer_single_process_for_small: bool = True
     stretch_to_uint8: bool = False
     input_color: str = "rgb"
+    fp16: bool = False
+    # 建筑物轮廓正则化配置 (dict)，None = 不启用
+    regularize: Optional[dict] = None
 
 
 @dataclass
@@ -225,40 +228,91 @@ def _class_allowed(class_id, classes):
     return classes is None or int(class_id) in set(int(value) for value in classes)
 
 
+def mask_geometry(mask, x_offset, y_offset):
+    """掩膜按像素边界转矢量，保留一个实例的多连通区域与孔洞。"""
+    import rasterio.features
+    from affine import Affine
+    if hasattr(mask, 'detach'):
+        mask = mask.detach().cpu().numpy()
+    mask = np.asarray(mask).squeeze()
+    if mask.ndim != 2:
+        raise ValueError('Expected a two-dimensional instance mask')
+    mask = mask > 0
+    rows, cols = np.where(mask)
+    if not rows.size:
+        return None, None
+    left, top, right, bottom = int(cols.min()), int(rows.min()), int(cols.max())+1, int(rows.max())+1
+    crop = mask[top:bottom, left:right].astype(np.uint8)
+    polygons = [geom['coordinates'] for geom, value in rasterio.features.shapes(
+        crop, mask=crop.astype(bool), connectivity=4,
+        transform=Affine.translation(x_offset + left, y_offset + top)) if value == 1]
+    if not polygons:
+        return None, None
+    def area(ring):
+        points = np.asarray(ring)
+        return abs(np.dot(points[:-1, 0], points[1:, 1]) - np.dot(points[1:, 0], points[:-1, 1])) / 2
+    primary = max(polygons, key=lambda rings: area(rings[0]))[0]
+    geometry = {'type': 'Polygon', 'coordinates': polygons[0]} if len(polygons) == 1 else {
+        'type': 'MultiPolygon', 'coordinates': polygons}
+    return primary, geometry
+
+
+_MASK_POOL = None
+
+
+def _mask_task(task):
+    return mask_geometry(*task)
+
+
 def _convert_tile_predictions(predictions, window, image_width, image_height, class_names, conf_threshold, classes):
     if predictions is None:
         return []
     det = predictions[0] if isinstance(predictions, list) else predictions
-    boxes = det.get("boxes")
-    scores = det.get("scores")
-    labels = det.get("labels")
+    boxes, scores = det.get('boxes'), det.get('scores')
     if boxes is None or scores is None:
         return []
-
+    def numpy(value):
+        return value.detach().cpu().numpy() if hasattr(value, 'detach') else np.asarray(value)
+    # 每张切片只拷贝一次分数、类别和框，避免逐实例 CUDA 同步。
+    boxes, scores = numpy(boxes), numpy(scores)
+    labels = numpy(det['labels']) if det.get('labels') is not None else np.zeros(len(scores), dtype=np.int64)
+    allowed = scores >= conf_threshold
+    if classes is not None:
+        allowed &= np.isin(labels, list(classes))
+    indices = np.flatnonzero(allowed)
+    if not len(indices):
+        return []
     x_offset, y_offset, _, _ = window
+    masks = det.get('masks')
+    if masks is None:
+        geometries = [(None, None)] * len(indices)
+    else:
+        if hasattr(masks, 'detach'):
+            selected = torch.as_tensor(indices, device=masks.device)
+            masks = masks.index_select(0, selected).detach().cpu().numpy()
+        else:
+            masks = np.asarray(masks)[indices]
+        tasks = [(mask, x_offset, y_offset) for mask in masks]
+        if len(tasks) >= 8:
+            global _MASK_POOL
+            if _MASK_POOL is None:
+                from concurrent.futures import ThreadPoolExecutor
+                _MASK_POOL = ThreadPoolExecutor(max_workers=4)
+            geometries = list(_MASK_POOL.map(_mask_task, tasks))
+        else:
+            geometries = [_mask_task(task) for task in tasks]
     detections = []
-    for index in range(len(boxes)):
-        score = float(scores[index])
-        if score < conf_threshold:
+    for index, (segment, geometry) in zip(indices, geometries):
+        if masks is not None and geometry is None:
             continue
-        class_id = int(labels[index]) if labels is not None else 0
-        if not _class_allowed(class_id, classes):
-            continue
-
-        box = boxes[index].detach().cpu().numpy() if hasattr(boxes[index], "detach") else np.asarray(boxes[index])
-        gx1, gy1 = clip_image_point(float(box[0]) + x_offset, float(box[1]) + y_offset, image_width, image_height)
-        gx2, gy2 = clip_image_point(float(box[2]) + x_offset, float(box[3]) + y_offset, image_width, image_height)
-        class_name = class_names[class_id] if class_names and class_id < len(class_names) else f"class_{class_id}"
-        detections.append(
-            {
-                "bbox_xyxy": [gx1, gy1, gx2, gy2],
-                "score": score,
-                "class_id": class_id,
-                "class_name": class_name,
-                "tile_xyxy": [int(value) for value in window],
-                "segment_xy": None,
-            }
-        )
+        box = boxes[index]
+        gx1, gy1 = clip_image_point(float(box[0])+x_offset, float(box[1])+y_offset, image_width, image_height)
+        gx2, gy2 = clip_image_point(float(box[2])+x_offset, float(box[3])+y_offset, image_width, image_height)
+        class_id = int(labels[index])
+        class_name = class_names[class_id] if class_names and class_id < len(class_names) else 'class_%d' % class_id
+        detections.append(dict(bbox_xyxy=[gx1,gy1,gx2,gy2], score=float(scores[index]),
+            class_id=class_id, class_name=class_name, tile_xyxy=[int(v) for v in window],
+            segment_xy=segment, mask_geometry=geometry))
     return detections
 
 
@@ -280,7 +334,9 @@ def predict_batch(reusable_model, images, windows, image_width, image_height, co
 
     batch_tensor = torch.stack(tensors, dim=0)
     target_sizes_tensor = torch.tensor(target_sizes, device=reusable_model.device)
-    with torch.no_grad():
+    from contextlib import nullcontext
+    mixed = torch.autocast('cuda', dtype=torch.float16) if config.fp16 and str(reusable_model.device).startswith('cuda') else nullcontext()
+    with torch.inference_mode(), mixed:
         outputs = reusable_model.model.model.model(batch_tensor)
         predictions = reusable_model.model.model.postprocess(outputs, target_sizes_tensor)
 
@@ -309,7 +365,15 @@ def dump_output_files(
     output_mask_shp_path,
     global_nms_enabled,
     raw_detection_count,
+    regularize=None,
 ):
+    # 先做正则化（会改写 merged_detections，写入 segment_xy_regularized），
+    # 这样 JSON 与可视化都能反映正则化结果。
+    if output_mask_shp_path is not None and regularize:
+        from .building_regularize import write_regularized_shapefile
+        write_regularized_shapefile(
+            output_mask_shp_path, merged_detections, meta_reader, regularize
+        )
     if output_path is not None:
         with output_path.open("w", encoding="utf-8") as file:
             json.dump(output, file, ensure_ascii=False, indent=2)
@@ -358,6 +422,7 @@ def build_output(source_path, meta_reader, config, devices, total_tiles, raw_det
         "tile_size": config.tile_size,
         "stride": stride,
         "batch_size": config.batch_size,
+        "instance_segmentation": any(d.get('mask_geometry') for d in merged_detections),
         "queue_size": queue_size,
         "tiles": total_tiles,
         "global_nms": bool(config.global_nms),
@@ -400,6 +465,9 @@ def run_single_process_inference(config, meta_reader, stride, worker_device, reu
     finally:
         reporter.close()
 
+    if processed_tiles != total_tiles:
+        raise RuntimeError('Tile coverage incomplete: %d/%d' % (processed_tiles, total_tiles))
+
     merged_detections = global_nms(all_detections, config.global_iou) if config.global_nms else all_detections
     output = build_output(
         source_path,
@@ -412,6 +480,7 @@ def run_single_process_inference(config, meta_reader, stride, worker_device, reu
         stride,
         0,
     )
+    output['processed_tiles'] = processed_tiles
     dump_output_files(
         output,
         merged_detections,
@@ -421,6 +490,7 @@ def run_single_process_inference(config, meta_reader, stride, worker_device, reu
         output_mask_shp_path,
         config.global_nms,
         len(all_detections),
+        regularize=config.regularize,
     )
     return output
 
@@ -500,6 +570,7 @@ def predictor_process(
                     "type": "result",
                     "worker_id": worker_id,
                     "batch_index": task["batch_index"],
+                    "windows": task["windows"],
                     "tiles": len(task["windows"]),
                     "detections": detections,
                 }
@@ -631,6 +702,7 @@ def run_multiprocess_inference(config: MultiprocessRFDETRInferConfig):
             process.start()
 
         all_detections = []
+        seen_windows = set()
         read_tiles = 0
         inferred_tiles = 0
         finished_workers = 0
@@ -645,6 +717,9 @@ def run_multiprocess_inference(config: MultiprocessRFDETRInferConfig):
                 try:
                     message = message_queue.get(timeout=1)
                 except queue.Empty:
+                    failed = [p.name for p in processes if p.exitcode not in (None, 0)]
+                    if failed:
+                        raise RuntimeError('Inference processes exited unexpectedly: ' + str(failed))
                     continue
 
                 if message["type"] == "read":
@@ -656,6 +731,11 @@ def run_multiprocess_inference(config: MultiprocessRFDETRInferConfig):
                         total_workers=len(worker_devices),
                     )
                 elif message["type"] == "result":
+                    for window in message['windows']:
+                        key = tuple(window)
+                        if key in seen_windows:
+                            raise RuntimeError('Duplicate image tile: ' + str(key))
+                        seen_windows.add(key)
                     all_detections.extend(message["detections"])
                     inferred_tiles += message["tiles"]
                     reporter.update_infer(
@@ -677,6 +757,12 @@ def run_multiprocess_inference(config: MultiprocessRFDETRInferConfig):
             reporter.close()
 
         join_processes(processes)
+        err = get_error_nowait(error_queue)
+        if err is not None:
+            raise RuntimeError('Multiprocess inference failed: ' + str(err))
+        if inferred_tiles != total_tiles or len(seen_windows) != total_tiles:
+            raise RuntimeError('Tile coverage incomplete: inferred=%d unique=%d expected=%d' %
+                               (inferred_tiles, len(seen_windows), total_tiles))
 
         merged_detections = global_nms(all_detections, config.global_iou) if config.global_nms else all_detections
         output = build_output(
@@ -690,6 +776,8 @@ def run_multiprocess_inference(config: MultiprocessRFDETRInferConfig):
             stride,
             config.queue_size,
         )
+        output['processed_tiles'] = inferred_tiles
+        output['unique_tiles'] = len(seen_windows)
         dump_output_files(
             output,
             merged_detections,

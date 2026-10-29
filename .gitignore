@@ -30,3 +30,6 @@ kernel_meta/
 .claude
 .codex
 .agents
+
+# 整理后的临时/中间产物
+tmp/

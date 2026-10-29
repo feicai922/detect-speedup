@@ -126,6 +126,8 @@ class MultiprocessMMDetInferConfig:
     small_image_threshold: int = 12000
     prefer_single_process_for_small: bool = True
     save_mask_overlay: bool = False
+    # 建筑物轮廓正则化配置 (dict)，None = 不启用
+    regularize: Optional[dict] = None
 
 
 @dataclass
@@ -1100,7 +1102,7 @@ def save_mask_overlay_image(image_path, detections, output_path, alpha=0.35):
 
     overlay = image.copy()
     for det in detections:
-        segment = det.get("segment_xy")
+        segment = det.get("segment_xy_regularized") or det.get("segment_xy")
         if not segment or len(segment) < 3:
             continue
         pts = np.asarray(segment, dtype=np.int32).reshape(-1, 1, 2)
@@ -1115,22 +1117,14 @@ def save_mask_overlay_image(image_path, detections, output_path, alpha=0.35):
 
 
 def write_shapefile(shp_path, detections, reader, geometry="bbox"):
-    shp_path = Path(shp_path)
-    shp_path.parent.mkdir(parents=True, exist_ok=True)
-    _delete_shapefile_sidecars(shp_path)
+    """Thin wrapper around :func:`shapefile_export.write_shapefile`.
 
-    if geometry == "bbox":
-        geometry_builder = lambda det: bbox_to_ring_coords(reader, det["bbox_xyxy"])
-        export_detections = detections
-    elif geometry == "mask":
-        geometry_builder = lambda det: mask_to_ring_coords(reader, det.get("segment_xy"))
-        export_detections = [det for det in detections if det.get("segment_xy")]
-    else:
-        raise ValueError(f"Unsupported geometry type: {geometry}")
-
-    _write_shp_shx(shp_path, export_detections, geometry_builder)
-    _write_dbf(shp_path.with_suffix(".dbf"), export_detections)
-    _write_prj(shp_path.with_suffix(".prj"), reader.crs_wkt)
+    Kept here for backward compatibility — the actual implementation now lives
+    in :mod:`shapefile_export` and adds per-detection tqdm progress plus
+    vectorised pixel→map conversion.
+    """
+    from .shapefile_export import write_shapefile as _shared_write_shapefile
+    _shared_write_shapefile(shp_path, detections, reader, geometry=geometry)
 
 
 def build_worker_devices(config):
@@ -1416,7 +1410,15 @@ def dump_output_files(
     output_mask_overlay_path,
     global_nms_enabled,
     raw_detection_count,
+    regularize=None,
 ):
+    # 先做正则化（会改写 merged_detections，写入 segment_xy_regularized），
+    # 这样 JSON 与可视化都能反映正则化结果。
+    if output_mask_shp_path is not None and regularize:
+        from .building_regularize import write_regularized_shapefile
+        write_regularized_shapefile(
+            output_mask_shp_path, merged_detections, meta_reader, regularize
+        )
     if output_path is not None:
         with output_path.open("w", encoding="utf-8") as file:
             json.dump(output, file, ensure_ascii=False, indent=2)
@@ -1559,6 +1561,7 @@ def run_single_process_inference(config, meta_reader, stride, worker_device, reu
         output_mask_overlay_path=output_mask_overlay_path,
         global_nms_enabled=config.global_nms,
         raw_detection_count=len(all_detections),
+        regularize=config.regularize,
     )
     return output
 
@@ -1650,6 +1653,7 @@ def run_direct_image_inference(config, meta_reader, worker_device, reusable_mode
         output_mask_overlay_path=output_mask_overlay_path,
         global_nms_enabled=config.global_nms,
         raw_detection_count=len(detections),
+        regularize=config.regularize,
     )
     return output
 
@@ -1877,6 +1881,7 @@ def run_multiprocess_inference(config: MultiprocessMMDetInferConfig):
         output_mask_overlay_path=output_mask_overlay_path,
         global_nms_enabled=config.global_nms,
         raw_detection_count=len(all_detections),
+        regularize=config.regularize,
     )
 
     meta_reader.close()

@@ -7,6 +7,7 @@ import traceback
 from pathlib import Path
 
 from .process_title_utils import dir_title, set_process_title
+from .image_splitting import expand_input_paths
 
 try:
     from tqdm import tqdm
@@ -259,8 +260,91 @@ def run_inputs(adapter):
             f"Supported suffixes: {sorted(adapter.supported_suffixes)}"
         )
 
-    print(f"[info] backend={adapter.backend_name}, found {len(input_files)} input files")
-    if input_path.is_file() or len(input_files) == 1 or tqdm is None:
+    # Opt-in pre-split: only kicks in when ``auto_split_threshold`` > 0.
+    # Default is 0, so the backends' built-in windowed streaming handles
+    # everything (and shows its own per-tile progress bar).
+    auto_split_threshold = getattr(adapter, "auto_split_threshold", 0) or 0
+    auto_split_workers = getattr(adapter, "auto_split_workers", 1)
+    auto_split_cache_dir = getattr(adapter, "auto_split_cache_dir", None)
+    split_records: list = []
+    if auto_split_threshold > 0:
+        print(
+            f"[auto-split] threshold={auto_split_threshold}px, "
+            f"checking {len(input_files)} file(s)...",
+            flush=True,
+        )
+        input_files, split_records = expand_input_paths(
+            input_files,
+            max_side=auto_split_threshold,
+            num_workers=auto_split_workers,
+            cache_dir=Path(auto_split_cache_dir) if auto_split_cache_dir else None,
+        )
+        if split_records:
+            total_new = sum(r.get("tiles", 0) for r in split_records)
+            errors = [r for r in split_records if r.get("error")]
+            cache_set = sorted({str(r["cache"]) for r in split_records if r.get("cache")})
+            if len(split_records) == 1:
+                rec = split_records[0]
+                if rec.get("error"):
+                    print(
+                        f"[auto-split] {rec['source'].name}: failed — {rec['error']}",
+                        flush=True,
+                    )
+                else:
+                    w, h = rec.get("size", (0, 0))
+                    print(
+                        f"[auto-split] {rec['source'].name}: {w}x{h} -> "
+                        f"{rec['tiles']} tiles at <= {auto_split_threshold}px "
+                        f"(cached at {rec['cache']})",
+                        flush=True,
+                    )
+            else:
+                print(
+                    f"[auto-split] {len(split_records)} source(s) split into "
+                    f"{total_new} tile(s) at <= {auto_split_threshold}px "
+                    f"(caches: {len(cache_set)})",
+                    flush=True,
+                )
+                for rec in split_records[:5]:
+                    if rec.get("error"):
+                        print(
+                            f"  - {rec['source'].name}: failed — {rec['error']}",
+                            flush=True,
+                        )
+                if len(split_records) > 5:
+                    print(f"  ... ({len(split_records) - 5} more)", flush=True)
+            if errors and not input_files:
+                raise RuntimeError(
+                    f"Auto-split failed for all {len(errors)} input(s); "
+                    f"first error: {errors[0]['error']}"
+                )
+
+    if not input_files:
+        raise RuntimeError(
+            f"No input tiles were produced from {input_path}."
+        )
+
+    print(
+        f"[info] backend={adapter.backend_name}, processing "
+        f"{len(input_files)} input file(s)",
+        flush=True,
+    )
+
+    # If auto-split expanded a single source into multiple tiles, route them
+    # through the directory worker so each device loads the model once and
+    # reuses it across every tile (otherwise we'd spawn fresh worker
+    # processes — and reload the model — for each tile).
+    auto_split_active = bool(
+        auto_split_threshold
+        and len(input_files) > 1
+        and split_records
+    )
+
+    use_directory_path = (
+        (not input_path.is_file() and len(input_files) > 1 and tqdm is not None)
+        or auto_split_active
+    )
+    if not use_directory_path:
         for index, input_file in enumerate(input_files, start=1):
             run_one(adapter, input_file, output_dir)
         return

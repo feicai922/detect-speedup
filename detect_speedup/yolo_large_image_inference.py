@@ -3,13 +3,15 @@ import argparse
 import json
 import math
 import multiprocessing as mp
+import os
 import queue
+import signal
 import time
 import traceback
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .process_title_utils import infer_title, read_title, set_process_title
 
@@ -31,6 +33,7 @@ warnings.filterwarnings(
 )
 
 from .yolo_image_io_and_export import (
+    bind_process_device,
     convert_results,
     count_windows,
     ensure_device,
@@ -44,6 +47,8 @@ from .yolo_image_io_and_export import (
 )
 from ultralytics import YOLO
 
+from .building_regularize import write_regularized_shapefile
+
 
 @dataclass
 class MultiprocessInferConfig:
@@ -54,6 +59,10 @@ class MultiprocessInferConfig:
     output_bbox_shp: Optional[str] = None
     output_mask_shp: Optional[str] = None
     save_json: bool = True
+    # Stream a normal JSON document while inference runs. This keeps huge-image
+    # inference bounded in RAM, but cannot perform operations requiring every
+    # detection in memory (global NMS, shapefile export, regularization).
+    stream_json: bool = False
     device: str = "cpu"
     devices: Optional[List[str]] = None
     worker_count: Optional[int] = None
@@ -75,12 +84,72 @@ class MultiprocessInferConfig:
     prefer_single_process_for_small: bool = True
     stretch_to_uint8: bool = False
     input_color: str = "rgb"
+    # 建筑物轮廓正则化配置 (dict)，None = 不启用
+    regularize: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class ReusableYOLOModel:
     model: Any
     device: str
+
+
+class StreamingJsonWriter:
+    """Atomically write prediction JSON without retaining detections in RAM."""
+
+    def __init__(self, output_path, metadata):
+        self.output_path = Path(output_path)
+        self.temp_path = self.output_path.with_name(f"{self.output_path.name}.partial")
+        self.file = self.temp_path.open("w", encoding="utf-8")
+        self.file.write("{")
+        for index, (key, value) in enumerate(metadata.items()):
+            if index:
+                self.file.write(",")
+            self.file.write(json.dumps(key, ensure_ascii=False))
+            self.file.write(":")
+            json.dump(value, self.file, ensure_ascii=False)
+        self.file.write(',"detections":[\n')
+        self.first_detection = True
+        self.detection_count = 0
+        self.closed = False
+
+    def write_detections(self, detections):
+        for detection in detections:
+            if not self.first_detection:
+                self.file.write(",\n")
+            json.dump(detection, self.file, ensure_ascii=False, separators=(",", ":"))
+            self.first_detection = False
+            self.detection_count += 1
+
+    def close(self, status="done"):
+        if self.closed:
+            return
+        self.file.write(
+            f'],"status":{json.dumps(status)},"raw_detections":{self.detection_count},'
+            f'"merged_detections":{self.detection_count}}}\n'
+        )
+        # A completed ``.json`` is the hand-off point to the post-processing
+        # stage.  Flush it to the filesystem before the atomic rename so an
+        # abrupt machine/filesystem failure cannot leave a seemingly completed
+        # JSON whose tail was still only buffered in userspace.
+        self.file.flush()
+        os.fsync(self.file.fileno())
+        self.file.close()
+        if status == "done":
+            os.replace(self.temp_path, self.output_path)
+        self.closed = True
+
+
+def terminate_when_parent_exits():
+    """Make CUDA workers exit when an OOM kill removes their parent (Linux)."""
+    if os.name != "posix":
+        return
+    try:
+        import ctypes
+        if ctypes.CDLL(None).prctl(1, signal.SIGTERM) == 0 and os.getppid() == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+    except Exception:
+        pass
 
 
 class ProgressReporter:
@@ -387,6 +456,15 @@ def validate_config(config):
         raise ValueError("queue_size must be positive.")
     if (config.stride or config.tile_size) <= 0:
         raise ValueError("stride must be positive.")
+    if config.stream_json:
+        if not config.save_json:
+            raise ValueError("stream_json requires save_json=True.")
+        if config.global_nms:
+            raise ValueError("stream_json is incompatible with global_nms; it requires all detections in RAM.")
+        if config.output_bbox_shp or config.output_mask_shp or config.output_shp:
+            raise ValueError("stream_json is incompatible with shapefile export; export it from completed JSON later.")
+        if config.regularize:
+            raise ValueError("stream_json is incompatible with regularize; it requires all masks in RAM.")
 
 
 def partitioned_windows(width, height, tile_size, stride, reader_id, reader_count):
@@ -419,6 +497,7 @@ def tile_reader_process(
 ):
     reader = None
     try:
+        terminate_when_parent_exits()
         set_process_title(read_title("yolo", reader_id=reader_id))
         reader = open_reader(
             source_path, stretch_to_uint8=stretch_to_uint8, output_color=input_color
@@ -472,7 +551,9 @@ def predictor_process(
     error_queue,
 ):
     try:
+        terminate_when_parent_exits()
         set_process_title(infer_title("yolo", device=device, worker_id=worker_id))
+        device = bind_process_device(device)
         ensure_device(device)
         model = YOLO(model_path)
 
@@ -573,6 +654,7 @@ def maybe_prepare_output_dirs(output_path, output_bbox_shp_path, output_mask_shp
 
 
 def load_reusable_model(config, worker_device):
+    worker_device = bind_process_device(worker_device)
     ensure_device(worker_device)
     return ReusableYOLOModel(model=YOLO(config.model), device=worker_device)
 
@@ -603,7 +685,14 @@ def dump_output_files(
     output_mask_shp_path,
     global_nms_enabled,
     raw_detection_count,
+    regularize=None,
 ):
+    # 先做正则化（会改写 merged_detections，写入 segment_xy_regularized），
+    # 这样 JSON 与可视化都能反映正则化结果。
+    if output_mask_shp_path is not None and regularize:
+        write_regularized_shapefile(
+            output_mask_shp_path, merged_detections, meta_reader, regularize
+        )
     if output_path is not None:
         with output_path.open("w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
@@ -728,6 +817,7 @@ def run_single_process_inference(config, meta_reader, stride, worker_device, reu
         output_mask_shp_path=output_mask_shp_path,
         global_nms_enabled=config.global_nms,
         raw_detection_count=len(all_detections),
+        regularize=config.regularize,
     )
     return output
 
@@ -858,6 +948,28 @@ def run_multiprocess_inference(config: MultiprocessInferConfig):
     finished_readers = 0
     finished_workers = 0
     reporter = ProgressReporter(total_tiles)
+    stream_writer = None
+    if config.stream_json:
+        stream_writer = StreamingJsonWriter(
+            output_path,
+            {
+                "image": str(source_path),
+                "backend": meta_reader.backend,
+                "image_size": {"width": meta_reader.width, "height": meta_reader.height},
+                "model": config.model,
+                "devices": worker_devices,
+                "reader_workers": config.reader_workers,
+                "worker_count": len(worker_devices),
+                "imgsz": config.imgsz,
+                "conf": config.conf,
+                "tile_size": config.tile_size,
+                "stride": stride,
+                "batch_size": config.batch_size,
+                "queue_size": config.queue_size,
+                "tiles": total_tiles,
+                "global_nms": False,
+            },
+        )
 
     try:
         while finished_workers < len(worker_devices):
@@ -883,26 +995,51 @@ def run_multiprocess_inference(config: MultiprocessInferConfig):
             elif message["type"] == "reader_done":
                 finished_readers += 1
             elif message["type"] == "result":
-                all_detections.extend(message["detections"])
+                if stream_writer is not None:
+                    stream_writer.write_detections(message["detections"])
+                    detection_count = stream_writer.detection_count
+                else:
+                    all_detections.extend(message["detections"])
+                    detection_count = len(all_detections)
                 inferred_tiles += message["tiles"]
                 reporter.update_infer(
                     inferred_tiles,
                     queue_size=safe_qsize(image_queue),
                     ready_workers=len(worker_devices) - finished_workers,
                     total_workers=len(worker_devices),
+                    detections=detection_count,
                 )
             elif message["type"] == "worker_done":
                 finished_workers += 1
     except KeyboardInterrupt:
         terminate_processes(processes)
+        if stream_writer is not None:
+            stream_writer.close(status="interrupted")
         raise
     except Exception:
         terminate_processes(processes)
+        if stream_writer is not None:
+            stream_writer.close(status="failed")
         raise
     finally:
         reporter.close()
 
     join_processes(processes)
+
+    if stream_writer is not None:
+        stream_writer.close()
+        meta_reader.close()
+        print(
+            f"[info] streamed {stream_writer.detection_count} detections to {output_path}; "
+            "global NMS and shapefile export were intentionally deferred."
+        )
+        return {
+            "image": str(source_path),
+            "status": "done",
+            "raw_detections": stream_writer.detection_count,
+            "merged_detections": stream_writer.detection_count,
+            "detections": [],
+        }
 
     if config.global_nms:
         merged_detections = global_nms(all_detections, config.global_iou)
@@ -945,6 +1082,7 @@ def run_multiprocess_inference(config: MultiprocessInferConfig):
         output_mask_shp_path=output_mask_shp_path,
         global_nms_enabled=config.global_nms,
         raw_detection_count=len(all_detections),
+        regularize=config.regularize,
     )
 
     meta_reader.close()
